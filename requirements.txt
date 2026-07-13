@@ -3,4 +3,5 @@ uvicorn[standard]
 anthropic
 sentence-transformers
 faiss-cpu
+rank-bm25
 python-dotenv

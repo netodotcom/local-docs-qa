@@ -1,10 +1,10 @@
-"""The question-answering pipeline: retrieve -> generate -> validate.
+"""The question-answering pipeline: hybrid retrieve -> rerank -> generate -> validate.
 
 Every failure mode maps to a typed error so the API layer can return a clear
 HTTP status and message:
 
     EmptyQuestionError    — question is blank
-    NoRelevantContentError — no chunk is similar enough to the question, or the
+    NoRelevantContentError — no chunk passes the re-ranker relevance gate, or the
                              model itself reported the context doesn't cover it
     UngroundedAnswerError — the generated answer drifted too far from the
                             retrieved chunks (grounding check failed)
@@ -18,7 +18,8 @@ import numpy as np
 
 from app import config
 from app.embeddings import Embedder
-from app.vector_store import SearchResult, VectorStore
+from app.retrieval import HybridRetriever, Reranker
+from app.vector_store import SearchResult
 
 # The model is instructed to output exactly this token when the retrieved
 # context does not contain the answer.
@@ -57,14 +58,15 @@ class Answer:
 
 
 class RAGService:
-    def __init__(self, embedder: Embedder, store: VectorStore):
-        self.embedder = embedder
-        self.store = store
+    def __init__(self, retriever: HybridRetriever, reranker: Reranker, embedder: Embedder):
+        self.retriever = retriever
+        self.reranker = reranker
+        self.embedder = embedder  # used by the grounding check
         self._client: anthropic.Anthropic | None = None
 
     @property
     def client(self) -> anthropic.Anthropic:
-        # Lazy so the server can start (and serve /health, /reindex) without a
+        # Lazy so the server can start (and serve /health, /ingest) without a
         # key; a missing key surfaces as a clear error on /ask instead.
         if self._client is None:
             try:
@@ -93,16 +95,22 @@ class RAGService:
         )
 
     def _retrieve(self, question: str) -> list[SearchResult]:
-        query_vector = self.embedder.embed_one(question)
-        results = self.store.search(query_vector)
-        if not results or results[0].score < config.RETRIEVAL_MIN_SCORE:
+        """Hybrid retrieval (dense + BM25) followed by cross-encoder re-ranking.
+
+        The chunks handed to the LLM are exactly the re-ranker's top-K, in the
+        re-ranker's order. Relevance is gated on the re-ranker score, which is
+        far sharper than raw retrieval similarity.
+        """
+        candidates = self.retriever.retrieve(question)
+        ranked = self.reranker.rerank(question, candidates)
+        if not ranked or ranked[0].score < config.RERANK_MIN_SCORE:
             raise NoRelevantContentError(
                 "No sufficiently relevant content was found in the indexed documents "
-                f"(best similarity {results[0].score:.2f} < {config.RETRIEVAL_MIN_SCORE:.2f})."
-                if results
+                f"(best re-ranker relevance {ranked[0].score:.4f} < {config.RERANK_MIN_SCORE:.4f})."
+                if ranked
                 else "The index contains no documents."
             )
-        return results
+        return ranked
 
     def _generate(self, question: str, sources: list[SearchResult]) -> str:
         context = "\n\n".join(
