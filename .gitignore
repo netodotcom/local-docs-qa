@@ -1,0 +1,16 @@
+# Environment / secrets
+.env
+
+# Virtualenv
+.venv/
+
+# Generated index
+storage/
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor
+.vscode/
+.idea/
